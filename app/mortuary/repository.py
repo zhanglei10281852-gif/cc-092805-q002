@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS custody_transfers (
  requested_by TEXT NOT NULL, accepted_by TEXT NOT NULL DEFAULT '', observed_seal_code TEXT NOT NULL DEFAULT '',
  condition_note TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
  idempotency_key TEXT NOT NULL, requested_at TEXT NOT NULL, accepted_at TEXT,
+ previous_transfer_id INTEGER REFERENCES custody_transfers(id),
  UNIQUE(case_id,idempotency_key)
 );
 CREATE TABLE IF NOT EXISTS facility_resources (
@@ -81,6 +82,9 @@ class MortuaryRepository:
 
     def ensure_schema(self) -> None:
         self.connection.executescript(SCHEMA)
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(custody_transfers)").fetchall()}
+        if "previous_transfer_id" not in columns:
+            self.connection.execute("ALTER TABLE custody_transfers ADD COLUMN previous_transfer_id INTEGER REFERENCES custody_transfers(id)")
 
     @staticmethod
     def one(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -100,6 +104,9 @@ class MortuaryRepository:
 
     def transfer_key(self, case_id: int, key: str) -> dict[str, Any] | None:
         return self.one(self.connection.execute("SELECT * FROM custody_transfers WHERE case_id=? AND idempotency_key=?", (case_id, key)).fetchone())
+
+    def latest_transfer(self, case_id: int) -> dict[str, Any] | None:
+        return self.one(self.connection.execute("SELECT * FROM custody_transfers WHERE case_id=? ORDER BY id DESC LIMIT 1", (case_id,)).fetchone())
 
     def resource_code(self, code: str) -> dict[str, Any] | None:
         return self.one(self.connection.execute("SELECT * FROM facility_resources WHERE code=?", (code,)).fetchone())

@@ -32,6 +32,7 @@ class CustodyTransferCreate(BaseModel):
     seal_code: str = Field(min_length=4, max_length=80)
     requested_by: str = Field(min_length=2, max_length=80)
     idempotency_key: str = Field(min_length=8, max_length=120)
+    previous_transfer_id: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def locations_must_differ(self):
