@@ -32,12 +32,21 @@ class CustodyTransferCreate(BaseModel):
     seal_code: str = Field(min_length=4, max_length=80)
     requested_by: str = Field(min_length=2, max_length=80)
     idempotency_key: str = Field(min_length=8, max_length=120)
+    # 前一次被拒收的交接编号；拒收后重新发起时必须填写
+    supersedes_transfer_id: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def locations_must_differ(self):
         if self.from_location == self.to_location:
             raise ValueError("交接起点与终点不能相同")
         return self
+
+
+class CustodyReject(BaseModel):
+    rejected_by: str = Field(min_length=2, max_length=80)
+    observed_seal_code: str = Field(min_length=4, max_length=80)
+    condition_note: str = Field(min_length=1, max_length=1000)
+    reject_reason_code: str = Field(default="seal_mismatch", min_length=2, max_length=60)
 
 
 class CustodyAccept(BaseModel):

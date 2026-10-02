@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Query
 
-from app.mortuary.schemas import BurialRightCreate, BurialRightRenew, CaseCreate, CustodyAccept, CustodyTransferCreate, InvoiceCreate, PaymentCreate, ReservationCreate, ResourceCreate, ServiceOrderCreate
+from app.mortuary.schemas import BurialRightCreate, BurialRightRenew, CaseCreate, CustodyAccept, CustodyReject, CustodyTransferCreate, InvoiceCreate, PaymentCreate, ReservationCreate, ResourceCreate, ServiceOrderCreate
 from app.mortuary.service import MortuaryService
 
 router = APIRouter(prefix="/api/mortuary", tags=["mortuary"])
@@ -24,6 +24,11 @@ def request_transfer(case_id: int, payload: CustodyTransferCreate) -> dict:
 @router.post("/custody-transfers/{transfer_id}/accept")
 def accept_transfer(transfer_id: int, payload: CustodyAccept) -> dict:
     return MortuaryService().accept_transfer(transfer_id, payload.model_dump())
+
+@router.post("/custody-transfers/{transfer_id}/reject", status_code=409)
+def reject_transfer(transfer_id: int, payload: CustodyReject) -> dict:
+    # 拒收决定随事务落库后返回冲突：响应体即留痕凭证
+    return MortuaryService().reject_transfer(transfer_id, payload.model_dump())
 
 @router.post("/resources", status_code=201)
 def create_resource(payload: ResourceCreate, actor: str = Query(min_length=2, max_length=80)) -> dict:

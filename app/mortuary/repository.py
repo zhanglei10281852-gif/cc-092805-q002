@@ -18,8 +18,10 @@ CREATE TABLE IF NOT EXISTS custody_transfers (
  id INTEGER PRIMARY KEY AUTOINCREMENT, case_id INTEGER NOT NULL REFERENCES mortuary_cases(id),
  from_location TEXT NOT NULL, to_location TEXT NOT NULL, seal_code TEXT NOT NULL,
  requested_by TEXT NOT NULL, accepted_by TEXT NOT NULL DEFAULT '', observed_seal_code TEXT NOT NULL DEFAULT '',
- condition_note TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
- idempotency_key TEXT NOT NULL, requested_at TEXT NOT NULL, accepted_at TEXT,
+ condition_note TEXT NOT NULL DEFAULT '', reject_reason_code TEXT NOT NULL DEFAULT '',
+ status TEXT NOT NULL DEFAULT 'pending', idempotency_key TEXT NOT NULL,
+ supersedes_transfer_id INTEGER REFERENCES custody_transfers(id),
+ requested_at TEXT NOT NULL, accepted_at TEXT,
  UNIQUE(case_id,idempotency_key)
 );
 CREATE TABLE IF NOT EXISTS facility_resources (
@@ -79,8 +81,24 @@ class MortuaryRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
 
+    # 旧版本库可能缺少的列：列名 -> 列定义
+    _MIGRATION_COLUMNS = {
+        "custody_transfers": {
+            "reject_reason_code": "TEXT NOT NULL DEFAULT ''",
+            "supersedes_transfer_id": "INTEGER REFERENCES custody_transfers(id)",
+        },
+    }
+
     def ensure_schema(self) -> None:
         self.connection.executescript(SCHEMA)
+        self._migrate_columns()
+
+    def _migrate_columns(self) -> None:
+        for table, columns in self._MIGRATION_COLUMNS.items():
+            existing = {row["name"] for row in self.connection.execute(f"PRAGMA table_info({table})").fetchall()}
+            for name, definition in columns.items():
+                if name not in existing:
+                    self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     @staticmethod
     def one(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -100,6 +118,9 @@ class MortuaryRepository:
 
     def transfer_key(self, case_id: int, key: str) -> dict[str, Any] | None:
         return self.one(self.connection.execute("SELECT * FROM custody_transfers WHERE case_id=? AND idempotency_key=?", (case_id, key)).fetchone())
+
+    def latest_transfer(self, case_id: int) -> dict[str, Any] | None:
+        return self.one(self.connection.execute("SELECT * FROM custody_transfers WHERE case_id=? ORDER BY id DESC LIMIT 1", (case_id,)).fetchone())
 
     def resource_code(self, code: str) -> dict[str, Any] | None:
         return self.one(self.connection.execute("SELECT * FROM facility_resources WHERE code=?", (code,)).fetchone())

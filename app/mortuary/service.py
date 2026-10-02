@@ -67,12 +67,103 @@ class MortuaryService:
             existing = repo.transfer_key(case_id, payload["idempotency_key"])
             if existing:
                 return existing
-            if case["current_location"] and case["current_location"] != payload["from_location"]:
+            supersedes_id = payload.get("supersedes_transfer_id")
+            latest = repo.latest_transfer(case_id)
+            if latest is not None and latest["status"] == "pending":
+                # 上一交接尚未处置，不能并行发起，避免两条待确认链互相覆盖位置
+                raise ConflictError(
+                    "存在待确认的交接，请先完成确认或拒收",
+                    context={"pending_transfer_id": latest["id"]},
+                )
+            if supersedes_id is not None:
+                prior = repo.transfer(supersedes_id)
+                if prior is None or prior["case_id"] != case_id:
+                    raise NotFoundError("被引用的前次交接记录不存在")
+                if prior["status"] != "rejected":
+                    raise ConflictError("只能引用已拒收的交接作为前次处置", context={"prior_status": prior["status"]})
+                if latest is None or prior["id"] != latest["id"]:
+                    raise ConflictError(
+                        "必须引用最近一次交接处置",
+                        context={"expected_transfer_id": None if latest is None else latest["id"]},
+                    )
+                # 拒收不移动遗体：当前保管位置以档案位置为准，未入库时以被拒收交接的起点为准
+                expected_location = case["current_location"] or prior["from_location"]
+                if payload["from_location"] != expected_location:
+                    raise ConflictError(
+                        "交接起点与当前保管位置不一致",
+                        context={"current_location": expected_location},
+                    )
+            elif latest is not None and latest["status"] == "rejected":
+                # 前次交接已拒收：重新发起必须引用该处置
+                raise ConflictError(
+                    "前次交接已被拒收，重新发起必须引用前次处置",
+                    context={"supersedes_transfer_id": latest["id"]},
+                )
+            elif case["current_location"] and case["current_location"] != payload["from_location"]:
                 raise ConflictError("交接起点与当前保管位置不一致", context={"current_location": case["current_location"]})
-            cursor = connection.execute("INSERT INTO custody_transfers(case_id,from_location,to_location,seal_code,requested_by,idempotency_key,requested_at) VALUES(?,?,?,?,?,?,?)", (case_id, payload["from_location"], payload["to_location"], payload["seal_code"], payload["requested_by"], payload["idempotency_key"], now))
+            cursor = connection.execute(
+                "INSERT INTO custody_transfers(case_id,from_location,to_location,seal_code,requested_by,idempotency_key,supersedes_transfer_id,requested_at) VALUES(?,?,?,?,?,?,?,?)",
+                (case_id, payload["from_location"], payload["to_location"], payload["seal_code"], payload["requested_by"], payload["idempotency_key"], supersedes_id, now),
+            )
             transfer = repo.transfer(int(cursor.lastrowid)) or {}
-            repo.event("case", case_id, "custody.requested", payload["requested_by"], {"transfer_id": transfer["id"], "from": payload["from_location"], "to": payload["to_location"]}, now)
+            repo.event(
+                "case", case_id, "custody.requested", payload["requested_by"],
+                {"transfer_id": transfer["id"], "from": payload["from_location"], "to": payload["to_location"], "supersedes_transfer_id": supersedes_id},
+                now,
+            )
             return transfer
+
+    def _record_rejection(
+        self,
+        connection: sqlite3.Connection,
+        repo: MortuaryRepository,
+        transfer: dict[str, Any],
+        *,
+        actor: str,
+        observed_seal_code: str,
+        condition_note: str,
+        reason_code: str,
+        now: str,
+    ) -> dict[str, Any]:
+        # 条件更新兜底并发：只有仍处于 pending 的交接才能形成拒收事实
+        cursor = connection.execute(
+            "UPDATE custody_transfers SET status='rejected',accepted_by=?,observed_seal_code=?,condition_note=?,reject_reason_code=?,accepted_at=? WHERE id=? AND status='pending'",
+            (actor, observed_seal_code, condition_note, reason_code, now, transfer["id"]),
+        )
+        if cursor.rowcount == 0:
+            raise ConflictError("交接已被并发处置，拒收未生效", context={"transfer_id": transfer["id"]})
+        repo.event(
+            "case", transfer["case_id"], "custody.rejected", actor,
+            {"transfer_id": transfer["id"], "reason": reason_code, "expected_seal_code": transfer["seal_code"], "observed_seal_code": observed_seal_code, "rejected_by": actor, "rejected_at": now},
+            now,
+        )
+        return repo.transfer(transfer["id"]) or {}
+
+    def reject_transfer(self, transfer_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        now = self.now()
+        with transaction(immediate=True) as connection:
+            repo = MortuaryRepository(connection)
+            transfer = repo.transfer(transfer_id)
+            if transfer is None:
+                raise NotFoundError("保管交接记录不存在")
+            if transfer["status"] == "rejected":
+                # 拒收事实不可改写：重复回报直接返回冲突，不覆盖任何字段
+                raise ConflictError(
+                    "该交接已被拒收，拒收结论不可变更",
+                    context={"transfer_id": transfer_id, "status": "rejected", "rejected_by": transfer["accepted_by"], "rejected_at": transfer["accepted_at"]},
+                )
+            if transfer["status"] != "pending":
+                raise ConflictError("当前交接状态不能拒收", context={"status": transfer["status"]})
+            rejected = self._record_rejection(
+                connection, repo, transfer,
+                actor=payload["rejected_by"], observed_seal_code=payload["observed_seal_code"],
+                condition_note=payload["condition_note"], reason_code=payload["reject_reason_code"], now=now,
+            )
+        # 事务已提交，再抛出错误响应：拒收决定与冲突响应在同一业务动作中可靠留痕
+        raise ConflictError(
+            "交接已拒收",
+            context={"transfer_id": transfer_id, "status": "rejected", "observed_seal_code": rejected["observed_seal_code"], "reject_reason_code": rejected["reject_reason_code"], "rejected_by": rejected["accepted_by"], "rejected_at": rejected["accepted_at"]},
+        )
 
     def accept_transfer(self, transfer_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         now = self.now()
@@ -84,15 +175,38 @@ class MortuaryService:
             if transfer["status"] == "accepted":
                 return transfer
             if transfer["status"] != "pending":
-                raise ConflictError("当前交接状态不能确认")
+                raise ConflictError(
+                    "该交接已被拒收，不能再确认",
+                    context={"transfer_id": transfer_id, "status": transfer["status"], "rejected_by": transfer["accepted_by"], "rejected_at": transfer["accepted_at"]},
+                )
+            case = repo.case(transfer["case_id"]) or {}
+            expected_location = case.get("current_location") or transfer["from_location"]
+            if expected_location != transfer["from_location"]:
+                raise ConflictError(
+                    "交接起点与当前保管位置不一致，该确认请求已过期",
+                    context={"transfer_id": transfer_id, "current_location": expected_location},
+                )
             if transfer["seal_code"] != payload["observed_seal_code"]:
-                connection.execute("UPDATE custody_transfers SET status='rejected',accepted_by=?,observed_seal_code=?,condition_note=?,accepted_at=? WHERE id=?", (payload["accepted_by"], payload["observed_seal_code"], payload["condition_note"], now, transfer_id))
-                repo.event("case", transfer["case_id"], "custody.rejected", payload["accepted_by"], {"transfer_id": transfer_id, "reason": "seal_mismatch"}, now)
-                raise ConflictError("封签编号不一致，交接已拒绝")
-            connection.execute("UPDATE custody_transfers SET status='accepted',accepted_by=?,observed_seal_code=?,condition_note=?,accepted_at=? WHERE id=?", (payload["accepted_by"], payload["observed_seal_code"], payload["condition_note"], now, transfer_id))
-            connection.execute("UPDATE mortuary_cases SET status='in_custody',current_location=?,version=version+1,updated_at=? WHERE id=?", (transfer["to_location"], now, transfer["case_id"]))
-            repo.event("case", transfer["case_id"], "custody.accepted", payload["accepted_by"], {"transfer_id": transfer_id, "location": transfer["to_location"]}, now)
-            return repo.transfer(transfer_id) or {}
+                rejected = self._record_rejection(
+                    connection, repo, transfer,
+                    actor=payload["accepted_by"], observed_seal_code=payload["observed_seal_code"],
+                    condition_note=payload["condition_note"], reason_code="seal_mismatch", now=now,
+                )
+            else:
+                cursor = connection.execute(
+                    "UPDATE custody_transfers SET status='accepted',accepted_by=?,observed_seal_code=?,condition_note=?,accepted_at=? WHERE id=? AND status='pending'",
+                    (payload["accepted_by"], payload["observed_seal_code"], payload["condition_note"], now, transfer_id),
+                )
+                if cursor.rowcount == 0:
+                    raise ConflictError("交接已被并发处置，确认未生效", context={"transfer_id": transfer_id})
+                connection.execute("UPDATE mortuary_cases SET status='in_custody',current_location=?,version=version+1,updated_at=? WHERE id=?", (transfer["to_location"], now, transfer["case_id"]))
+                repo.event("case", transfer["case_id"], "custody.accepted", payload["accepted_by"], {"transfer_id": transfer_id, "location": transfer["to_location"]}, now)
+                return repo.transfer(transfer_id) or {}
+        # 封签不符：拒收已随事务提交，随后返回冲突，保证留痕不被回滚
+        raise ConflictError(
+            "封签编号不一致，交接已拒收",
+            context={"transfer_id": transfer_id, "status": "rejected", "observed_seal_code": rejected["observed_seal_code"], "reject_reason_code": "seal_mismatch", "rejected_by": rejected["accepted_by"], "rejected_at": rejected["accepted_at"]},
+        )
 
     def create_resource(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
         now = self.now()
